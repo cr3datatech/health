@@ -15,7 +15,7 @@ This document traces the complete path from when a user opens the page to where 
 | Backend API | FastAPI (Python) | `api/index.py` |
 | Auth middleware | `fastapi-clerk-auth` | `api/index.py` |
 | Streaming transport | Server-Sent Events (SSE) | `api/index.py` → `pages/product.tsx` |
-| LLM | OpenAI API | `api/index.py` |
+| LLM | OpenAI API (`gpt-4o-mini`) | `api/index.py` |
 | Markdown rendering | `react-markdown` + `remark-gfm` | `pages/product.tsx` |
 
 ---
@@ -25,8 +25,8 @@ This document traces the complete path from when a user opens the page to where 
 | URL | File | Access |
 |-----|------|--------|
 | `/` | `pages/index.tsx` | Public — landing page |
-| `/product` | `pages/product.tsx` | Requires sign-in + active subscription |
-| `/api` | `api/index.py` | Requires valid Clerk JWT Bearer token |
+| `/product` | `pages/product.tsx` | Requires sign-in + `premium_subscription` plan |
+| `/api` | `api/index.py` | POST — requires valid Clerk JWT Bearer token |
 
 ---
 
@@ -58,7 +58,7 @@ export default function App({ Component, pageProps }: AppProps) {
 
 **File**: `pages/index.tsx`
 
-- Next.js renders the `Home` component
+- Next.js renders the `Home` component for MediNotes Pro
 - Clerk's `<SignedOut>` / `<SignedIn>` components inspect the session:
   - **Not signed in** → shows Sign In button (`clerk.openSignIn()` modal)
   - **Signed in** → shows "Go to App" link and `<UserButton>`
@@ -84,7 +84,7 @@ export default function App({ Component, pageProps }: AppProps) {
 - The JWT contains standard claims plus Clerk-specific ones:
   - `sub` — user ID
   - `pla` — subscription plan (e.g. `u:premium_subscription`)
-- `<SignedIn>` re-renders to show the "Go to App" button
+- `<SignedIn>` re-renders to show the "Go to App" / "Open Consultation Assistant" button
 
 ---
 
@@ -92,71 +92,89 @@ export default function App({ Component, pageProps }: AppProps) {
 
 **File**: `pages/product.tsx`
 
-The `Product` component renders immediately and wraps `IdeaGenerator` inside Clerk's `<Protect>` component:
+The `Product` component renders immediately and wraps `ConsultationForm` inside Clerk's `<Protect>` component:
 
 ```tsx
 <Protect
-    condition={(has) =>
-        has({ plan: 'pro_plan' }) || has({ plan: 'premium_subscription' })
-    }
+    plan="premium_subscription"
     fallback={<PricingTable />}
 >
-    <IdeaGenerator />
+    <ConsultationForm />
 </Protect>
 ```
 
 - Clerk evaluates the session's subscription claims **client-side**
-- **No active plan** → renders `<PricingTable />` (Clerk's hosted billing UI)
-- **Has `pro_plan` or `premium_subscription`** → renders `<IdeaGenerator />`
+- **No `premium_subscription` plan** → renders `<PricingTable />` (Clerk's hosted billing UI)
+- **Has `premium_subscription`** → renders `<ConsultationForm />`
 
 ---
 
-### 5. IdeaGenerator Mounts and Requests a JWT
+### 5. ConsultationForm Renders — User Fills in the Form
 
-**File**: `pages/product.tsx` — `IdeaGenerator` component
+**File**: `pages/product.tsx` — `ConsultationForm` component
+
+Unlike the saas idea generator (which fires immediately on mount), the health app is **form-driven** — the user fills in three fields and clicks a button:
 
 ```tsx
-const { getToken } = useAuth();
-
-useEffect(() => {
-    (async () => {
-        const jwt = await getToken();
-        // ...
-    })();
-}, []);
+const [patientName, setPatientName] = useState('');
+const [visitDate, setVisitDate]     = useState<Date | null>(new Date());
+const [notes, setNotes]             = useState('');
+const [output, setOutput]           = useState('');
+const [loading, setLoading]         = useState(false);
 ```
 
-- `getToken()` returns the current Clerk session JWT
-- This token will be sent as `Authorization: Bearer <jwt>` to the backend
+- **Patient Name** — text input
+- **Date of Visit** — `react-datepicker` date picker (formatted as `yyyy-MM-dd`)
+- **Consultation Notes** — multi-line textarea
+- **Generate Summary** button triggers `handleSubmit`
 
 ---
 
-### 6. Frontend Opens SSE Connection with Auth Header
+### 6. User Submits — Frontend Fetches JWT and Opens SSE
 
 **File**: `pages/product.tsx`
 
 ```tsx
-await fetchEventSource('/api', {
-    headers: { Authorization: `Bearer ${jwt}` },
-    onmessage(ev) {
-        buffer += ev.data;
-        setIdea(buffer);
-    },
-    onerror(err) {
-        throw err; // Stop retrying on fatal errors
-    }
-});
+async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setOutput('');
+    setLoading(true);
+
+    const jwt = await getToken();
+
+    await fetchEventSource('/api', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${jwt}`,
+        },
+        body: JSON.stringify({
+            patient_name: patientName,
+            date_of_visit: visitDate?.toISOString().slice(0, 10),
+            notes,
+        }),
+        onmessage(ev) {
+            buffer += ev.data;
+            setOutput(buffer);
+        },
+        onclose() { setLoading(false); },
+        onerror(err) {
+            controller.abort();
+            setLoading(false);
+        },
+    });
+}
 ```
 
-- Uses `@microsoft/fetch-event-source` instead of native `EventSource`
-  - Native `EventSource` **cannot** set custom headers
-  - `fetchEventSource` supports custom headers and better error handling
-- Opens a persistent HTTP connection to `/api`
-- The `Authorization` header carries the Clerk JWT
+- `getToken()` returns the current Clerk session JWT
+- `fetchEventSource` sends a **POST** (not GET) with a JSON body
+  - Native `EventSource` cannot POST or set custom headers — `@microsoft/fetch-event-source` is required
+- The `Authorization: Bearer <jwt>` header carries authentication
+- The body contains `patient_name`, `date_of_visit`, and `notes`
 
 ---
 
-### 7. FastAPI Receives the Request and Verifies the JWT
+### 7. FastAPI Receives the POST and Verifies the JWT
 
 **File**: `api/index.py`
 
@@ -164,36 +182,53 @@ await fetchEventSource('/api', {
 clerk_config = ClerkConfig(jwks_url=os.getenv("CLERK_JWKS_URL"))
 clerk_guard  = ClerkHTTPBearer(clerk_config)
 
-@app.get("/api")
-def idea(creds: HTTPAuthorizationCredentials = Depends(clerk_guard)):
+@app.post("/api")
+def consultation_summary(
+    visit: Visit,
+    creds: HTTPAuthorizationCredentials = Depends(clerk_guard),
+):
 ```
 
-- `fastapi-clerk-auth` extracts the Bearer token from the `Authorization` header
+- FastAPI parses the JSON body into the `Visit` Pydantic model:
+
+```python
+class Visit(BaseModel):
+    patient_name: str
+    date_of_visit: str
+    notes: str
+```
+
+- `fastapi-clerk-auth` extracts the Bearer token from `Authorization`
 - Fetches Clerk's public JWKS from `CLERK_JWKS_URL` and verifies the JWT signature
-- Rejects the request with 401 if invalid/expired
-- On success, decoded JWT claims are available via `creds.decoded`
+- Rejects the request with **403 Forbidden** if the token is invalid or expired
+- On success, `creds.decoded["sub"]` contains the user's ID (available for auditing)
 
 ---
 
-### 8. Backend Reads Plan and Selects Model
+### 8. Backend Builds the Prompt
 
 **File**: `api/index.py`
 
 ```python
-pla = creds.decoded.get("pla", "")
-subscription_plan = pla.removeprefix("u:").removeprefix("o:") if pla else "free"
+system_prompt = """
+You are provided with notes written by a doctor from a patient's visit.
+Your job is to summarize the visit for the doctor and provide an email.
+Reply with exactly three sections with the headings:
+### Summary of visit for the doctor's records
+### Next steps for the doctor
+### Draft of email to patient in patient-friendly language
+"""
 
-if subscription_plan == "premium_subscription":
-    model = "gpt-5.1"
-elif subscription_plan == "pro_plan":
-    model = "gpt-5-nano"
-else:
-    model = "gpt-5-nano"
+def user_prompt_for(visit: Visit) -> str:
+    return f"""Create the summary, next steps and draft email for:
+Patient Name: {visit.patient_name}
+Date of Visit: {visit.date_of_visit}
+Notes:
+{visit.notes}"""
 ```
 
-- The `pla` claim contains the plan slug prefixed with `u:` (user) or `o:` (org)
-- The prefix is stripped to get the plain slug
-- Model is assigned by tier: `premium_subscription` → `gpt-5.1`, others → `gpt-5-nano`
+- The system prompt instructs the model to produce exactly three structured sections
+- The user prompt injects the form data from the POST body
 
 ---
 
@@ -202,47 +237,50 @@ else:
 **File**: `api/index.py`
 
 ```python
-client = OpenAI()
-stream = client.chat.completions.create(model=model, messages=prompt, stream=True)
+client = OpenAI(api_key=openai_key, max_retries=0, timeout=8.0)
+stream = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=prompt,
+    stream=True,
+)
 ```
 
-- OpenAI SDK streams the response as a generator of delta chunks
-- Each chunk contains a small piece of the final text
+- Uses `gpt-4o-mini` — fast, cost-effective, widely available
+- `max_retries=0` and `timeout=8.0` prevent hanging within Vercel's 10s function limit
+- OpenAI streams the response as a generator of delta chunks
 
 ---
 
-### 10. Backend Streams SSE Response
+### 10. Backend Streams SSE Response (with Error Handling)
 
 **File**: `api/index.py`
 
 ```python
 def event_stream():
-    yield (
-        f"data: *Model: {model}, Subscription Plan: {subscription_plan}*\n"
-        "data: \n"
-        "data: ---\n"
-        "data: \n"
-        "data: **JWT Claims:**\n"
-        f"{jwt_claim_lines}\n"
-        "data: \n"
-        "data: ---\n"
-        "data: \n\n"
-    )
-    for chunk in stream:
-        text = chunk.choices[0].delta.content
-        if text:
-            # Each line must be a separate `data:` event for correct SSE parsing
-            lines = text.split("\n")
-            for line in lines[:-1]:
-                yield f"data: {line}\n\n"
-                yield "data:  \n"
-            yield f"data: {lines[-1]}\n\n"
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        yield "data: **ERROR: OPENAI_API_KEY is not set on this deployment.**\n\n"
+        return
+
+    try:
+        # ... OpenAI call ...
+        for chunk in stream:
+            text = chunk.choices[0].delta.content
+            if text:
+                lines = text.split("\n")
+                for line in lines[:-1]:
+                    yield f"data: {line}\n\n"
+                    yield "data:  \n"
+                yield f"data: {lines[-1]}\n\n"
+    except Exception as e:
+        yield f"data: **ERROR: {type(e).__name__}: {str(e)}**\n\n"
 
 return StreamingResponse(event_stream(), media_type="text/event-stream")
 ```
 
-- First yields a header block: model name, plan, and all JWT claims
-- Then streams each OpenAI delta chunk formatted as SSE (`data: <text>\n\n`)
+- The response is **always** `text/event-stream` — errors are streamed as SSE messages, not HTTP exceptions
+- This prevents the `@microsoft/fetch-event-source` library from throwing a content-type mismatch error
+- Any OpenAI error (auth, timeout, model error) appears directly in the app's output area
 - Multi-line chunks are split so each line is its own SSE event
 
 ---
@@ -254,29 +292,29 @@ return StreamingResponse(event_stream(), media_type="text/event-stream")
 ```tsx
 onmessage(ev) {
     buffer += ev.data;
-    setIdea(buffer);
+    setOutput(buffer);
 }
 ```
 
 - Each SSE message appends to `buffer`
-- `setIdea(buffer)` triggers a React re-render on every chunk — streaming effect
+- `setOutput(buffer)` triggers a React re-render on every chunk — streaming effect
 
 ---
 
-### 12. ReactMarkdown Renders the Content
+### 12. ReactMarkdown Renders the Three Sections
 
 **File**: `pages/product.tsx`
 
 ```tsx
 <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
-    {idea}
+    {output}
 </ReactMarkdown>
 ```
 
 - `ReactMarkdown` converts accumulated markdown to HTML on every re-render
 - `remarkGfm` — GitHub Flavored Markdown (tables, strikethrough, etc.)
 - `remarkBreaks` — converts single newlines to `<br>` tags
-- Content appears incrementally as chunks arrive
+- The three sections (`### Summary`, `### Next steps`, `### Draft email`) appear incrementally as chunks arrive
 
 ---
 
@@ -293,21 +331,23 @@ User signs in → Clerk issues JWT with `pla` claim
     ↓
 User navigates to /product
     ↓
-<Protect> checks plan claim → shows <PricingTable> or <IdeaGenerator>
+<Protect plan="premium_subscription"> → shows <PricingTable> or <ConsultationForm>
     ↓
-IdeaGenerator mounts → getToken() fetches JWT
+User fills in patient name, date, consultation notes → clicks Generate Summary
     ↓
-fetchEventSource('/api', { Authorization: Bearer <jwt> })
+handleSubmit → getToken() fetches JWT
     ↓
-FastAPI verifies JWT via Clerk JWKS
+fetchEventSource POST /api  { Authorization: Bearer <jwt>, body: { patient_name, date_of_visit, notes } }
     ↓
-Reads pla claim → selects model (gpt-5.1 or gpt-5-nano)
+FastAPI parses Visit model + verifies JWT via Clerk JWKS
     ↓
-OpenAI streams delta chunks → FastAPI formats as SSE
+Builds system + user prompt with consultation notes
     ↓
-Frontend buffer accumulates chunks → setIdea() → re-render
+OpenAI gpt-4o-mini streams delta chunks → FastAPI formats as SSE
     ↓
-ReactMarkdown renders markdown → content appears incrementally
+Frontend buffer accumulates chunks → setOutput() → re-render
+    ↓
+ReactMarkdown renders three sections: Summary / Next Steps / Patient Email
 ```
 
 ---
@@ -326,11 +366,12 @@ npm install
 | `react` | 19.2.3 | UI component library |
 | `react-dom` | 19.2.3 | React DOM renderer |
 | `@clerk/nextjs` | ^6 | Clerk auth: `ClerkProvider`, `<Protect>`, `<PricingTable>`, `useAuth`, `getToken` |
-| `@microsoft/fetch-event-source` | ^2.0.1 | SSE client supporting custom headers (needed for Authorization) |
+| `@microsoft/fetch-event-source` | ^2.0.1 | SSE client supporting POST + custom headers |
+| `react-datepicker` | ^9.1.0 | Date picker for the visit date field |
 | `react-markdown` | ^10.1.0 | Renders markdown string as HTML |
 | `remark-gfm` | ^4.0.1 | GitHub Flavored Markdown plugin |
 | `remark-breaks` | ^4.0.0 | Converts `\n` to `<br>` |
-| `@tailwindcss/typography` | ^0.5.19 | Tailwind prose styling |
+| `@tailwindcss/typography` | ^0.5.19 | Tailwind prose styling for markdown output |
 | `tailwindcss` | ^4 | Utility-first CSS framework |
 | `typescript` | ^5 | TypeScript compiler |
 
@@ -342,10 +383,11 @@ pip install -r requirements.txt
 
 | Package | Purpose |
 |---------|---------|
-| `fastapi` | Web framework — defines the `/api` route |
-| `uvicorn` | ASGI server to run FastAPI |
+| `fastapi` | Web framework — defines the `POST /api` route |
+| `uvicorn` | ASGI server to run FastAPI locally |
 | `openai` | Official OpenAI Python SDK (streaming support) |
 | `fastapi-clerk-auth` | FastAPI dependency that verifies Clerk JWTs via JWKS |
+| `pydantic` | Data validation — `Visit` model for the POST body |
 
 ### Environment Variables — `.env.local`
 
@@ -363,8 +405,9 @@ pip install -r requirements.txt
 | File | Role |
 |------|------|
 | `pages/_app.tsx` | Root — wraps app in `ClerkProvider` |
-| `pages/index.tsx` | Landing page — sign-in / pricing preview |
-| `pages/product.tsx` | Protected page — plan gate + idea generator + SSE client |
-| `api/index.py` | API endpoint — JWT verification, model selection, SSE streaming |
-| `.env.local` | Environment variables (not committed) |
-| `next.config.ts` | Next.js configuration (API proxy to FastAPI) |
+| `pages/index.tsx` | Landing page — MediNotes Pro hero + sign-in |
+| `pages/product.tsx` | Protected page — plan gate + consultation form + SSE client |
+| `api/index.py` | API endpoint — JWT verification, prompt building, SSE streaming |
+| `requirements.txt` | Python dependencies |
+| `.env.local` | Environment variables (not committed to git) |
+| `next.config.ts` | Next.js configuration |
